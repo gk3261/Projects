@@ -1,0 +1,593 @@
+---
+title: "SeoulBike_Analysis"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Introduction
+The rental bike system, prevalent in many global cities, offers benefits such as reduced emissions, exercise for users, and low costs. In Seoul, South Korea, the system is popular due to demand for supplementary transport and expanded bike routes. Despite its popularity, Seoul's bike system faced financial losses, prompting the city government to plan bike advertisements. To analyze and optimize the system, SeoulBikeData (8,760 instances, 14 variables) from December 2017-November 2018 is used. Previous studies identified climate factors' influence on bike rentals. This paper explores predictive variables for bike demand and identifies the best model in regression. Additionally, it analyzes the relationship between variables (e.g., hour of the day) and subway congestion using classification methods with data until April 2023. The paper aims to find the best models for bike demand prediction and to understand subway congestion patterns for potential system enhancements (which might be used in the future to predict additional rental bike allocation or bike advertisement-related factors like pricing/placement).
+
+See full ME315 paper here: https://docs.google.com/document/d/1j8RLBnmRl6ABRttiAyr64F5MeeMMVa9TW2WmKhU2DEY/edit?usp=sharing
+
+(Data sources: UCI Repository (archive.ics.uci.edu, Seoul Bike Sharing Demand) and Open Data Portal (data.go.kr, Seoul Transportation Corporation_Subway congestion information))
+
+# Setup
+
+```{r}
+# if not yet installed
+install.packages("tidyverse")
+install.packages("glmnet")
+```
+
+```{r}
+library(tidyverse)
+library(glmnet) #for regularization, ridge, lasso, and elastic nets
+
+knitr::opts_chunk$set(echo = TRUE) # setup
+SeoulBikes <- read.table("SeoulBikeData.txt", header =T, sep = ",")
+
+colnames(SeoulBikes) <- c("Date", "Rented.Bike.Count", "Hour", "TemperatureC", "Humidity", "WindSpeedMS", "Visibility10m", "DewPointTempC", "SolarRadiation", "RainfallMM", "SnowfallCM", "Seasons", "Holiday", "Functioning.Day")
+```
+
+
+# Data Cleaning
+In order to perform regression, I'll assign categorical variables as numbers.
+
+The following changes were made:
+- Seasons: Spring (1), Summer (2), Fall (3), Winter (4)
+- Functioning Day: Yes (1), No (0)
+- Holiday: Yes (1), No (0)
+
+```{r}
+# Now I want to make all of the categorical variables into numerics
+
+# Assign seasons: 1 = Spring, 2 = Summer, 3 = Fall, 4 = Winter
+SeoulBikes.Seasons <- select(SeoulBikes, Seasons)
+SeoulBikes.Seasons <- ifelse(SeoulBikes.Seasons == "Spring", 1,
+                             ifelse(SeoulBikes.Seasons == "Summer", 2,
+                                    ifelse(SeoulBikes.Seasons == "Autumn", 3, 4)))
+
+# Replace that vector in SeoulBikes
+SeoulBikes[,12] <- SeoulBikes.Seasons
+colnames(SeoulBikes)[12] <- "Seasons"
+
+# Functioning Day: Yes = 1, No = 0
+SeoulBikes.FD <- select(SeoulBikes,Functioning.Day)
+SeoulBikes.FD <- ifelse (SeoulBikes.FD == "Yes", 1, 0)
+# Replace vector in SeoulBikes
+SeoulBikes[,14] <- SeoulBikes.FD
+
+# Holiday? No Holiday = 0
+SeoulBikes.Holiday <- select(SeoulBikes,Holiday)
+SeoulBikes.Holiday <- ifelse(SeoulBikes.Holiday == "No Holiday", 0, 1)
+SeoulBikes[,13] <- SeoulBikes.Holiday
+```
+
+I will now clean the dates, which are currently not in a form that R recognizes as date-month-year.
+After doing this, I have separate columns for Year, Month, Day. I also put the first column (Date) in
+double form, so that I will be able to run the column through the cor() function later.
+
+```{r}
+ # Dates
+SeoulBikes.Dates <- select (SeoulBikes, Date)
+SeoulBikes.Dates <- SeoulBikes.Dates[1:nrow(SeoulBikes.Dates), 1] # This gets rid of the label "Date", which as.Date can't convert
+SeoulBikes.Dates <- as.Date(SeoulBikes.Dates, format = "%d/%m/%Y")
+
+# I'm going to save months and years into separate columns to use later on. I'm adding this to the SeoulBikes dataset
+SeoulBikes.Years <- year(SeoulBikes.Dates)
+SeoulBikes.Months <- month(SeoulBikes.Dates)
+SeoulBikes.Days <- mday(SeoulBikes.Dates)
+SeoulBikes <- cbind(SeoulBikes, SeoulBikes.Years, SeoulBikes.Months, SeoulBikes.Days)
+
+# I only want to know year and month, now -- for easier classification
+SeoulBikes.Dates <- year(SeoulBikes.Dates) * 100 + month(SeoulBikes.Dates)
+
+# I'm now going to put this back into the SeoulBikes dataset
+SeoulBikes[1:nrow(SeoulBikes),1] <- SeoulBikes.Dates
+
+# Date to numeric. Before it was char so I have to unlist it, then convert it into a numeric vector, then put it back in. This way, I can use it in the cor() function later on.
+num_vector <- as.numeric(unlist(SeoulBikes[1]))
+SeoulBikes[1] <- num_vector
+colnames(SeoulBikes)[15] <- "Year"
+colnames(SeoulBikes)[16] <- "Month"
+colnames(SeoulBikes)[17] <- "Day"
+```
+
+# General Information
+```{r}
+summary(SeoulBikes)
+```
+We will visualize all variables in a scatterplot matrix. From this, we can see the general relationships between the parameters -- which we'll delve deeper into later.
+
+```{r}
+plot(SeoulBikes) 
+```
+Before delving deeper into the data, I would like to know (for reference) the general relationships between these variables and number of bikes rented:
+
+```{r}
+#Rented Bike Count across seasons?
+aggregate(SeoulBikes, Rented.Bike.Count ~ Seasons,FUN=mean)
+# From this, we can see that: Winter (lowest bike count, at mean of 225). Summer (highest bike count, at mean of 1034). Spring and Fall are similar. with mean of 730 and 819 respectively.
+
+# Rented Bike Count across months?
+aggregate(SeoulBikes, Rented.Bike.Count ~ Month, FUN=mean)
+# From this, we can see that the number of rented bikes peaks in June.
+
+# Rented Bike Count across years?
+aggregate(SeoulBikes, Rented.Bike.Count ~ Year, FUN=mean)
+
+# Rented Bike Count across months and years?
+aggregate(SeoulBikes, Rented.Bike.Count ~ Date, FUN= mean)
+
+# Rented Bike Count across whether it's a holiday?
+aggregate(SeoulBikes, Rented.Bike.Count ~ Holiday, FUN=mean)
+# Rented Bike count tends to be much higher on non-holidays
+
+# Rented Bike Count across hour?
+aggregate(SeoulBikes, Rented.Bike.Count~Hour, FUN=mean)
+# This has multiple peaks, so I want to draw a chart for it to see it better. 
+
+ggplot(data=SeoulBikes) + geom_point(mapping=aes(x = Hour, y = Rented.Bike.Count))
+# The number of bikes rented peaks at: 8am and 6pm. (Hypothesis of correlation, although this doesn't imply causation: perhaps because people are commuting to and from work?)
+
+```
+
+
+# Methods: Regression
+
+## LINEAR REGRESSION
+
+#### Assigning Train/Test sets
+
+We will first set training and test sets (70/30 divide).
+```{r}
+train.size <- (nrow(SeoulBikes))*.7
+train <- sample(1:nrow(SeoulBikes), train.size)
+test <- -train
+
+SeoulBikes.train <- SeoulBikes[train,]
+SeoulBikes.test <- SeoulBikes[test,]
+```
+
+#### Fitting Linear Model, using least squares on the training set
+
+```{r}
+summary(SeoulBikes)
+# pearson's correlation
+cor(SeoulBikes)
+
+#1. trained on training data
+lm.fit1 <- lm(Rented.Bike.Count~., data = SeoulBikes.train)
+summary(lm.fit1)
+# from the summary, we can tell these are significant: Date, Hour, Temperature, Humidity, Wind Speed, Solar Radiation, Rainfall, Seasons, Holiday, functioning day, SeoulBikes.years, SeoulBikes.months
+plot(lm.fit1,which=c(1,2))
+
+#2. obtain predictions on test set
+lm.pred <-  predict(lm.fit1, SeoulBikes.test)
+
+#3. evaluate prediction quality
+mean((SeoulBikes.test[, "Rented.Bike.Count"] - lm.pred)^2)    
+
+```
+From the graph, we can tell that the pattern is non-linear -- thus, a linear model is likely not the best fit.
+
+Based on the variables that summary(lmfit1) tells us were most significant (***) (Date, Hour, TemperatureC, Humidity, WindSpeedMS, SolarRadiation, RainfallMM, Holiday, Functioning.Day, Year, Month), I would like to see if a linear fit with interactions works better. I will proceed to group variables that seem correlated together, like the weather-related variables.
+
+```{r}
+# 1. Train on training data
+lm.fit2 <- lm(Rented.Bike.Count ~ Date + Date*Hour + Hour + TemperatureC*Humidity*WindSpeedMS*SolarRadiation*RainfallMM + Seasons + Holiday + Functioning.Day + Year + Month, data = SeoulBikes.train)
+
+plot(lm.fit2,which=c(1,2))
+
+#2. obtain predictions on test set
+lm.pred <-  predict(lm.fit2, SeoulBikes.test)
+
+#3. evaluate prediction quality
+mean((SeoulBikes.test[, "Rented.Bike.Count"] - lm.pred)^2)    
+```
+MSE is slightly lower, but the graphs show me that this still is not the best model.
+
+Also, from this, I know that these variables are significant/correlation is significant:
+Date                                                         2.528e+01  1.895e+00  13.342  < 2e-16 ***
+Hour                                                        -6.162e+04  4.898e+03 -12.582  < 2e-16 ***
+TemperatureC                                                 4.476e+01  3.486e+00  12.841  < 2e-16 ***
+WindSpeedMS                                                  9.339e+01  2.164e+01   4.316 1.61e-05 ***
+Seasons                                                     -2.184e+01  5.453e+00  -4.005 6.25e-05 ***
+Holiday                                                     -1.125e+02  2.060e+01  -5.462 4.83e-08 ***
+Functioning.Day                                              9.255e+02  2.505e+01  36.939  < 2e-16 ***
+Year                                                        -2.592e+03  1.748e+02 -14.827  < 2e-16 ***
+Date:Hour                                                    3.055e-01  2.427e-02  12.588  < 2e-16 ***
+TemperatureC:Humidity                                       -4.090e-01  5.247e-02  -7.795 7.19e-15 ***
+TemperatureC:WindSpeedMS                                     7.008e+00  1.620e+00   4.326 1.54e-05 ***
+Humidity:WindSpeedMS                                        -1.679e+00  4.007e-01  -4.189 2.83e-05 ***
+Humidity:SolarRadiation                                      9.250e+00  1.924e+00   4.809 1.55e-06 ***
+
+
+This data is likely not well-fitted by a linear model because it is skewed. We can see the distribution of the number of rented bikes below:
+
+```{r}
+densityFunc <- density(SeoulBikes$Rented.Bike.Count)
+plot(densityFunc , type = "n", main = "rented bike count")
+polygon(densityFunc, col="lightgray", border = "gray")
+```
+
+
+## Best Subset Selection
+
+```{r}
+install.packages("leaps")
+library(leaps)
+# Step 1. Learn Model
+regfit.full=regsubsets(Rented.Bike.Count ~ ., nvmax = 14,
+                        data = SeoulBikes.train)
+reg.summary=summary(regfit.full)
+reg.summary
+
+# plots number of variables by RSS
+plot(reg.summary$rss,xlab="Number of Variables",ylab="RSS",type="l")
+best.model=which.min(reg.summary$bic)
+best.model
+
+# plots number of variables by BIC
+plot(reg.summary$bic,xlab="Number of Variables",ylab="BIC",type='l')
+points(best.model,reg.summary$bic[best.model], col="red",cex=2,pch=20)
+
+# Step 2. Obtain predictions
+Xtest=model.matrix(Rented.Bike.Count ~  ., data = SeoulBikes.test) # get matrix X for test data
+head(Xtest)
+
+# gets estimated parameters (Betas) from the best model (one with lowest BIC)
+coefbest = coef(regfit.full,best.model)
+coefbest
+
+# multiplies X-matrix by coefbest (estimated parameters aka Betas). This is the equation Yhat = Xhat*Betas 
+pred=Xtest[,names(coefbest)]%*%coefbest # Xbeta 
+coefbest
+rbc <- SeoulBikes.test$Rented.Bike.Count
+
+# Step 3. obtain MSE
+squared = rbc-pred
+mean((squared)^2)
+```
+MSE was 192711.2 (trial reference for paper).
+
+## Ridge
+
+Lambda will be chosen by cross-validation.
+```{r}
+train.mat <- model.matrix(Rented.Bike.Count ~., data = SeoulBikes.train)
+test.mat <- model.matrix(Rented.Bike.Count ~., data = SeoulBikes.test)
+
+# 1. Learn Model
+# Ridge regression has a hyperparameter, so we need to find the optimal value before learning it
+# Sets a grid of lambdas to try:
+grid <- 10^ seq(4, -2, length = 100)
+
+# 2. Performs Cross-Validation to obtain the optimal hyperparameter (lambda) value
+mod.ridge <-  cv.glmnet(train.mat, SeoulBikes.train[, "Rented.Bike.Count"], 
+                        alpha = 0, lambda = grid, thresh = 1e-12)
+# alpha = 0  ---> means it runs ridge regression. If alpha = 1, runs lasso regression (I'll do this in the next section).
+
+lambda.best <-  mod.ridge$lambda.min
+lambda.best
+
+# 3. Obtain prediction using model with optimal lambda
+
+ridge.pred <- predict(mod.ridge, newx = test.mat, s = lambda.best)
+
+# 4. Find MSE 
+mean((SeoulBikes.test[,"Rented.Bike.Count"] - ridge.pred)^2)
+
+```
+Mean Squared Error seems to be similar to subset selection.
+
+## Lasso
+
+Lambda will also be chosen by cross-validation, here.
+
+```{r}
+
+mod.lasso <-  cv.glmnet(train.mat, SeoulBikes.train[, "Rented.Bike.Count"], alpha = 1, lambda = grid, thresh = 1e-12)
+lambda.best <-  mod.lasso$lambda.min
+lambda.best
+lasso.pred <-  predict(mod.lasso, newx = test.mat, s = lambda.best)
+
+# Find MSE
+mean((SeoulBikes.test[, "Rented.Bike.Count"] - lasso.pred)^2)
+
+```
+
+Test MSE is still similar to ridge and linear fitting.
+
+The coefficients look like:
+```{r}
+mod.lasso <-  glmnet(model.matrix(Rented.Bike.Count ~ . , data = SeoulBikes), 
+                     SeoulBikes[, "Rented.Bike.Count"], alpha = 1)
+
+predict(mod.lasso, s = lambda.best, type = "coefficients")
+```
+Pushed to zero: Year
+Variables that have most impact on fit: Snowfall, Functioning.Day, Humidity,SolarRadiation
+
+
+## TREE-BASED METHODS
+
+#### Fitting Regression Trees
+
+```{r}
+library(tree)
+
+# train sample
+tree.SeoulBikes = tree(Rented.Bike.Count~., SeoulBikes.train)
+summary(tree.SeoulBikes)
+
+# Plots the tree created
+plot(tree.SeoulBikes)
+text(tree.SeoulBikes,pretty=0, cex=0.7)
+
+# Cross-Validation
+cv.SeoulBikes = cv.tree(tree.SeoulBikes)
+plot(cv.SeoulBikes$size, cv.SeoulBikes$dev, type ='b')
+
+# Prunes tree + Plots it
+prune.SeoulBikes = prune.tree(tree.SeoulBikes, best = 10)
+plot(prune.SeoulBikes)
+text(prune.SeoulBikes,pretty=0, cex = 0.7)
+
+# Calculates error
+yhat = predict(tree.SeoulBikes, newdata = SeoulBikes.test)
+SeoulBikes.test.RBC = SeoulBikes.test$Rented.Bike.Count
+mean((yhat-SeoulBikes.test.RBC)^2)
+
+# trying test with the pruned tree
+yhat=predict(prune.SeoulBikes,newdata=SeoulBikes.test)
+mean((yhat - SeoulBikes.test.RBC)^2)
+
+```
+
+
+#### Bagging and Random Forests
+
+```{r}
+# Bagging
+library(randomForest)
+
+# Let's use 5 variables
+bag.SeoulBikes = randomForest(Rented.Bike.Count~., data=SeoulBikes.train, mtry=5, importance=TRUE)
+bag.SeoulBikes
+
+# Error
+yhat.bag = predict(bag.SeoulBikes, newdata=SeoulBikes.test)
+mean((yhat.bag - SeoulBikes.test$Rented.Bike.Count)^2)
+
+```
+
+MSE is quite low here in comparison.
+
+Let's try 8 variables
+```{r}
+# Bagging
+# Let's use 8 variables
+bag.SeoulBikes = randomForest(Rented.Bike.Count~., data=SeoulBikes.train, mtry=8, importance=TRUE)
+bag.SeoulBikes
+# Error
+yhat.bag = predict(bag.SeoulBikes, newdata=SeoulBikes.test)
+mean((yhat.bag - SeoulBikes.test$Rented.Bike.Count)^2)
+
+```
+MSE is quite low, at about 46787.
+
+```{r}
+# Bagging
+
+# Let's use 10 variables
+bag.SeoulBikes = randomForest(Rented.Bike.Count~., data=SeoulBikes.train, mtry=10, importance=TRUE)
+bag.SeoulBikes
+
+# Error
+yhat.bag = predict(bag.SeoulBikes, newdata=SeoulBikes.test)
+mean((yhat.bag - SeoulBikes.test$Rented.Bike.Count)^2)
+
+```
+
+
+```{r}
+# Bagging
+# Let's use 13 variables
+bag.SeoulBikes = randomForest(Rented.Bike.Count~., data=SeoulBikes.train, mtry=13, importance=TRUE)
+bag.SeoulBikes
+
+# Error
+yhat.bag = predict(bag.SeoulBikes, newdata=SeoulBikes.test)
+mean((yhat.bag - SeoulBikes.test$Rented.Bike.Count)^2)
+
+```
+
+Slightly improved, but not a LOT.
+```{r}
+# Bagging
+library(randomForest)
+
+# Let's use 8 variables and 1000 trees
+bag.SeoulBikes = randomForest(Rented.Bike.Count~., data=SeoulBikes.train, mtry=8, ntree = 1000, importance=TRUE)
+bag.SeoulBikes
+
+# Error
+yhat.bag = predict(bag.SeoulBikes, newdata=SeoulBikes.test)
+mean((yhat.bag - SeoulBikes.test$Rented.Bike.Count)^2)
+
+```
+
+#### Boosting & Tree-Based Methods
+Now, let's try boosting -- using trees of depth 5 and boosting size to 500.
+
+```{r}
+library(gbm)
+
+boost.SeoulBikes =gbm(Rented.Bike.Count~., data=SeoulBikes.train, distribution="gaussian", n.trees=500, interaction.depth =4)
+summary(boost.SeoulBikes)
+yhat.boost=predict(boost.SeoulBikes, newdata = SeoulBikes.train, n.trees = 500)
+mean((yhat.boost-SeoulBikes.test$Rented.Bike.Count)^2)
+
+```
+Hour seems to have the most influence, followed by date, day, and year.
+The MSE is quite high -- to make boosting work better, I would have to increase the number of trees or depth. However, my data set is too big for my computer to run this in a reasonable time.
+
+
+# CLASSIFICATION
+
+
+```{r}
+SeoulTrains<-read.csv("SeoulTraffic1.csv", header=T)
+SeoulTrains <- na.omit(SeoulTrains)
+```
+
+
+#### Distribution
+```{r}
+library(tidyverse)
+v <- (select(SeoulTrains, X5.5, X6, X6.5, X7 , X7.5 , X8 , X8.5 , X9 , X9.5 , X10 , X10.5 , X11 , X11.5 , X12 , X12.5 , X13 , X13.5 , X14 , X14.5 , X15 , X15.5 , X16 , X16.5 , X17 , X17.5 , X18 , X18.5 , X19 , X19.5 , X20 , X20.5 , X21 , X21.5 , X22 , X22.5 , X23 , X23.5 , X24, X0.5))
+
+mean_vector <- colMeans(v)
+
+x_vector <- matrix(c(5.5, 6, 6.5, 7 , 7.5 , 8 , 8.5 , 9 , 9.5 , 10 , 10.5 , 11, 11.5 , 12 , 12.5 , 13 , 13.5 , 14 , 14.5 , 15 , 15.5 , 16 , 16.5 , 17 , 17.5 , 18 , 18.5 , 19 , 19.5 , 20 , 20.5 , 21 , 21.5 , 22 , 22.5 , 23 , 23.5 , 24, .5))
+
+plot(x = x_vector, y = mean_vector)
+# peaks at 8 (8am) and 18 (6pm)
+```
+
+
+## LDA
+
+#### Predicting Train No based on Direction & congestion by hour
+```{r}
+train.random.no <-   sample(x =(1:nrow(SeoulTrains)), size = (nrow(SeoulTrains)*.5))
+
+SeoulTrains.train <- SeoulTrains[train.random.no,]
+
+test <- -train.random.no
+
+SeoulTrains.test <- SeoulTrains[test,]
+
+Line.test<-SeoulTrains$Line[test]
+
+# split data
+
+library(MASS)
+lda.fit <-lda(Line ~ Direction + X5.5 + X6 + X6.5 + X7 + X7.5 + X8 + X8.5 + X9 + X9.5 + X10 + X10.5 + X11 + X11.5 + X12 + X12.5 + X13 + X13.5 + X14 + X14.5 + X15 + X15.5 + X16 + X16.5 + X17 + X17.5 + X18 + X18.5 + X19 + X19.5 + X20 + X20.5 + X21 + X21.5 + X22 + X22.5 + X23 + X23.5 + X24 + X0.5, data = SeoulTrains.train)
+lda.pred <- predict(lda.fit, SeoulTrains.test)
+mean(lda.pred$class != Line.test)
+
+```
+13.7% test error
+
+#### Predicting Direction based on congestion by hour
+```{r}
+train.random.no <-   sample(x =(1:nrow(SeoulTrains)), size = (nrow(SeoulTrains)*.5))
+
+SeoulTrains.train <- SeoulTrains[train.random.no,]
+
+test <- -train.random.no
+
+SeoulTrains.test <- SeoulTrains[test,]
+# QDA
+
+Cannot predict line number because it would be too many variables.
+
+# Predicting Direction based on congestion by hour
+```{r}
+# QDA
+
+# Binary directions: North/South = 0, Clockwise/Counterclockwise = 1 
+SeoulTrains.Dir.Binary <- SeoulTrains$Direction
+SeoulTrains.Dir.Binary <- ifelse(SeoulTrains.Dir.Binary == 1, 0,
+                                 ifelse(SeoulTrains.Dir.Binary == 0, 0,
+                                        ifelse(SeoulTrains.Dir.Binary == 2, 1,
+                                               ifelse(SeoulTrains.Dir.Binary == 3, 1,0))))
+
+# resample.
+SeoulTrains$Direction <- SeoulTrains.Dir.Binary
+train.random.no <-   sample(x =(1:nrow(SeoulTrains)), size = (nrow(SeoulTrains)*.5))
+SeoulTrains.train <- SeoulTrains[train.random.no,]
+test <- -train.random.no
+SeoulTrains.test <- SeoulTrains[test,]
+Direction.test<-SeoulTrains$Direction[test]
+
+
+qda.fit <-  qda(Direction ~ X5.5 + X6 + X6.5 + X7 + X7.5 + X8 + X8.5 + X9 + X9.5 + X10 + X10.5 + X11 + X11.5 + X12 + X12.5 + X13 + X13.5 + X14 + X14.5 + X15 + X15.5 + X16 + X16.5 + X17 + X17.5 + X18 + X18.5 + X19 + X19.5 + X20 + X20.5 + X21 + X21.5 + X22 + X22.5 + X23 + X23.5 + X24 + X0.5, data = SeoulTrains.train)
+qda.pred <- predict(qda.fit, SeoulTrains.test)
+mean(qda.pred$class != Direction.test)
+```
+
+7.9% test error rate
+
+## Logistic Regression
+
+```{r}
+# Logistic regression
+
+glm.fit <- glm(Direction ~ X5.5 + X6 + X6.5 + X7 + X7.5 + X8 + X8.5 + X9 + X9.5 + X10 + X10.5 + X11 + X11.5 + X12 + X12.5 + X13 + X13.5 + X14 + X14.5 + X15 + X15.5 + X16 + X16.5 + X17 + X17.5 + X18 + X18.5 + X19 + X19.5 + X20 + X20.5 + X21 + X21.5 + X22 + X22.5 + X23 + X23.5 + X24 + X0.5, data = SeoulTrains.train, family = binomial)
+
+glm.probs <- predict(glm.fit, SeoulTrains.test, type = "response")
+glm.pred <- rep(0, length(glm.probs))
+glm.pred[glm.probs >0.5] <- 1
+mean(glm.pred != Direction.test)
+```
+
+6.15% error rate
+
+## Classification: K-Means and Hierarchical -- Not included in paper because it did not seem to give much information.
+
+```{r}
+# Let's first try visualizing this
+x <- select(SeoulBikes,Hour, Rented.Bike.Count)
+# numeric matrix
+plot(x)
+# I would try 3 clusters
+```
+
+
+```{r}
+# When 3 clusters
+km.out = kmeans(x,3,nstart =20)
+km.out$cluster 
+plot(x, col=(km.out$cluster+1), main="K-Means Clustering Results with K=2", xlab="", ylab="", pch=20, cex=2)
+
+```
+
+
+```{r}
+# When 5 clusters
+km.out = kmeans(x,5,nstart =20)
+km.out$cluster 
+plot(x, col=(km.out$cluster+1), main="K-Means Clustering Results with K=2", xlab="", ylab="", pch=20, cex=2)
+
+```
+K-means Clustering doesn't really work well here. It's not really telling us anything, it seems.
+
+Let's try hierarchal clustering, then.
+
+```{r}
+# replace:
+seoulbikes.labs = labels(SeoulBikes)
+sd.data = scale(select(SeoulBikes, Rented.Bike.Count, Hour))
+data.dist=dist(sd.data)
+
+# Complete linkage
+plot(hclust(data.dist), labels =seoulbikes.labs, main="Complete Linkage", xlab="", sub="",ylab="", cex = 0.7)
+
+# Average linkage
+plot(hclust(data.dist, method="average"), labels=seoulbikes, main="Average Linkage", xlab="", sub="",ylab="", cex = 0.7)
+
+# Single Linkage
+plot(hclust(data.dist, method="single"), labels=seoulbikes,  main="Single Linkage", xlab="", sub="",ylab="", cex = 0.7)
+
+```
+The thing is, here, that clearly there are too many possible clusters and the data set is too large. Not very helpful, either.
+
+
+# Conclusion
+I find that bagging is the most effective (least error) model out of those implemented to predict rented bike count by other variables within the SeoulBikeData dataset. One weakness of this analysis is that this is only data obtained across one year and obtained around five years ago. If the data were more recent and more extensive, it might be better applied to present-day needs. I also suspect that boosting would have been more effective than it was in this paper if I could use less skewed samples and a faster computer for more or deeper trees. 
+
+	I additionally find that traffic congestion peaks at the same hours that rental bike demand peaks –– suggesting that the peaks are correlated with the public’s most common times to commute. Based on this observation, I used classification models to determine that there is also a relationship between specific train lines/routes and congestion. This could potentially point to a way that Seoul city council seeks to strategically place rental bikes in order to minimize its deficits. (I additionally include examples of K-Means and Hierarchical clustering using rented bike count and hour in the code, but I did not include this in the paper because it did not seem to offer much information.)
